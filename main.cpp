@@ -13,37 +13,32 @@
   */
 //################ Iniciar librerias ###################//
 
-//Librerias de LORA
+// * Librerias de LORA
 #include <SPI.h>
 #include <RH_RF95.h>
 #include <cmath>
 
-  //modificar a valores necesarios
+// * Valores para el LoRa
 #define RFM95_CS 10 
 #define RFM95_RST 9
 #define RFM95_INT 2
-
-  // Change to 434.0 or other frequency, must match RX's freq!
 #define RF95_FREQ 915.0
 
-  // Singleton instance of the radio driver
-RH_RF95 rf95(RFM95_CS, RFM95_INT);
-
-///// Librerias de GPS
+// * Librerias de GPS
   #include <TinyGPS++.h>
   #include <SoftwareSerial.h>
-  SoftwareSerial gpsSerial(10,11); //RX = 10; TX = 11
-  TinyGPSPlus gps; // Declaramos el GPS
-///// Librerias de brujula
+
+
+// * Librerias de brujula
   #include <Wire.h>
   #include <LSM303D.h>
-  LSM303D compass;
+  //LSM303D compass;
 
-  int16_t accel[3];  // we'll store the raw acceleration values here
+/*  int16_t accel[3];  // we'll store the raw acceleration values here
   int16_t magnet[3];  // raw magnetometer values stored here
   float realAccel[3];  // calculated acceleration values here
   float heading_actual, titleHeading;
-
+*/
 //// Libreria de servo
 
   #include <Servo.h>
@@ -76,8 +71,8 @@ int fase_actual = 0; // fase actual del robot
 float velocidad_vertical_actual = 0; // metros por segundo
 float altura_actual = 0; // metros
 float heading_actual = 0; // grados sobrel el horizonte 
-float gps_latitud_actual = 0; // latitud
-float gps_longitud_actual = 0; // longitud
+//float gps_latitud_actual = 0; // latitud
+//float gps_longitud_actual = 0; // longitud
 float altura_inicial = 0; // Una captura de la altura en metros del robot al inicio (Idealmente que sea cerca al piso)
 
 
@@ -90,33 +85,148 @@ unsigned long tiempo_fase0 = 0;
 // heading deseado (Esta variable se consigue haciendo el calculo de orientacion de nuestra meta al robot)
 float goal_heading = 20;
 
+// ? Definicion de la interfaz sensor
+class Sensor{
+  public:
+    virtual float getData() = 0;
+}
+
+// ? Definicion del sensor GPS
+class GPS : public Sensor {
+public:
+  SoftwareSerial& gpsSerial;
+  TinyGPSPlus& gps;
+  float& gps_latitud_actual;
+  float& gps_longitud_actual;
+
+  GPS(SoftwareSerial& serial, TinyGPSPlus& gps, float& latitud, float& longitud)
+    : gpsSerial(serial), gps(gps), gps_latitud_actual(latitud), gps_longitud_actual(longitud) {
+      gpsSerial.begin(9600);
+    }
+
+  // * Obtener datos del GPS
+  void getData(LoRa& lora) override {
+    gps_latitud_actual = gps.location.lat();
+    gps_longitud_actual = gps.location.lng();
+    lora.sendData("GPS", String(gps_latitud_actual).c_str()); // * Mandar los datos al LoRa
+  }
+
+};
+
+SoftwareSerial gpsSerial(10, 11); // RX = 10, TX = 11
+TinyGPSPlus gps; // Declaramos el GPS
+float gps_latitud_actual = 0.0; // ! No modificar directamente
+float gps_longitud_actual = 0.0; // ! No modificar directamente
+
+
+// ? Inicialización de la brujula
+
+class Compass : public Sensor {
+public:
+  LSM303D& lsm303d;
+  float heading_actual;
+
+  Compass(LSM303D& compass)
+    : lsm303d(compass), heading_actual(0.0) {
+      int16_t accel[3];
+      int16_t magnet[3];
+      float realAccel[3];
+      float titleHeading;
+
+      char rtn = 0;
+      rtn = lsm303d.initI2C();
+      if (rtn != 0) {
+        Serial.println("\r\nLSM303D is not found");
+        while (1);
+      } else {
+        Serial.println("\r\nLSM303D is found");
+      }
+
+      lsm303d.getAccel(accel);
+      while (!lsm303d.isMagReady());
+      lsm303d.getMag(magnet);
+
+      for (int i = 0; i < 3; i++) {
+        realAccel[i] = accel[i] / pow(2, 15) * ACCELE_SCALE;
+      }
+      titleHeading = lsm303d.getTiltHeading(magnet, realAccel);
+  }
+
+  void getData() override {
+    heading_actual = lsm303d.heading();
+    lora.sendData("Compass", String(heading_actual).c_str()); // * Mandar los datos al LoRa
+  }
+
+  // * Mandar los datos al LoRa
+  void sendData(LoRa& lora) override {
+    char sensorName[] = "Compass";
+    char radiopacket[50];
+    sprintf(radiopacket, "%s: Heading %.2f", sensorName, heading_actual);
+
+    lora.sendData(radiopacket);
+  }
+};
+
+LSM303D compass;
+
+class LoRa {
+private:
+  RH_RF95& rf95;
+
+public:
+  LoRa(RH_RF95& radio)
+    : rf95(radio) {
+      pinMode(RFM95_RST, OUTPUT);
+      delay(10);
+      digitalWrite(RFM95_RST, HIGH);
+
+      while (!Serial);
+      Serial.begin(9600);
+
+      digitalWrite(RFM95_RST, LOW);
+      delay(10);
+      digitalWrite(RFM95_RST, HIGH);
+
+      while (!rf95.init()) {
+        Serial.println("LoRa radio init failed");
+        while (1);
+      }
+      Serial.println("LoRa radio init OK!");
+
+      if (!rf95.setFrequency(RF95_FREQ)) {
+        Serial.println("setFrequency failed");
+        while (1);
+      }
+
+      Serial.print("Set Freq to: "); Serial.println(RF95_FREQ);
+
+      rf95.setTxPower(23, false);
+    }
+
+  void sendData(const char* radiopacket) {
+    Serial.print("Sending "); Serial.println(radiopacket);
+
+    rf95.send((uint8_t *)radiopacket, strlen(radiopacket));
+    rf95.waitPacketSent();
+
+    Serial.println("Packet sent");
+  }
+};
+
+// Singleton instance of the radio driver
+RH_RF95 rf95(RFM95_CS, RFM95_INT);
+
+
 void setup() {
   
 ///// Setup: Iniciar sensores y comunicacion
-// iniciar comm i2c para sensores
+// * iniciar comm i2c para sensores
   Wire.begin();
-//iniciar comm serial
+// ! Iniciar comunicaciones seriales
+  // ? Comunicacion serial del Compass
   Serial.begin(9600);  // Start serial port
-//iniciar gps
+  // ? Comunicacion serial del GPS
   gpsSerial.begin(9600);
-//iniciar brujula
-  char rtn = 0;
-  rtn = Lsm303d.initI2C();
-    //rtn = Lsm303d.initSPI(SPI_CS);
-    if (rtn != 0) { // Initialize the LSM303, using a SCALE full-scale range
-        Serial.println("\r\nLSM303D is not found");
-        while (1);
-    } else {
-        Serial.println("\r\nLSM303D is found");
-    }
-    Lsm303d.getAccel(accel);
-    while (!Lsm303d.isMagReady()); // wait for the magnetometer readings to be ready
-    Lsm303d.getMag(magnet);  // get the magnetometer values, store them in mag
-
-    for (int i = 0; i < 3; i++) {
-        realAccel[i] = accel[i] / pow(2, 15) * ACCELE_SCALE;  // calculate real acceleration values, in units of g
-    }
-    titleHeading = Lsm303d.getTiltHeading(magnet, realAccel);
 
 ///// Setup: Iniciar outputs (motores y servos)
 //Definir los outputs para el motor
@@ -133,9 +243,9 @@ void setup() {
 fase_actual = fase_de_inicio; // declarar la fase en la que vamos a iniciar (con el parametro de mision fase_de_inicio) 
 
 /// TODO: guardar altura inicial del robot para uso en las fases futuras
-  altura_inicial = 0
+  altura_inicial = 0;
 
-  velocidad_vertical_actual = ((accel * tiempo_caida) + 0); 
+  velocidad_vertical_actual = ((accel * tiempo_caida) + 0);
   altura_actual = gps.altitude.meters();
   heading_actual = Lsm303d.getHeading(magnet); 
   gps_latitud_actual = gps.location.lat();
@@ -156,11 +266,20 @@ if(DEBUG){
   Serial.print(gps_longitud_actual);
 }
 
-////// Iniciar timers de los sensores
+// ! Iniciar timers de los sensores, no se usarian
 unsigned long timer_barometro = millis(); // en millis
 unsigned long timer_gps = millis();  // en millis
 unsigned long timer_brujula = millis();  // en millis
 unsigned long timer_lora = millis(); //en millis
+
+// Iniciar timer lectura de los sensores
+unsigned long previousMillis = 0;
+const unsigned long interval = 5000;
+
+// * Iniciar sensores
+GPS gpsSensor(gpsSerial, gps, gps_latitud_actual, gps_longitud_actual); // ? Declaracion del GPS
+Compass compassSensor(compass); // ? Declaracion del Compass
+LoRa loraModule(rf95);
 
 }
 
@@ -171,14 +290,18 @@ void loop() {
 
 ///////// Leer todos los sensores
 
-// timer de gps
-if((millis()-timer_gps) > periodo_gps){
-  gps_latitud_actual = gps.location.lat();
-  gps_longitud_actual = gps.location.lng();
-  timer_gps = millis();
-}
+// * Lectura de todos los sensores
+unsigned long currentMillis = millis();
 
-// timer de barometro
+if (currentMillis - previousMillis >= interval) {
+    // Actualiza el tiempo del último ciclo
+    previousMillis = currentMillis;
+    gpsSensor.getData(loraModule);
+    if(fase_actual == 4){
+      compassSensor.getData(loraModule);
+    }
+}
+// ! timer de barometro
 if((millis()-timer_barometro) > periodo_barometro){
   /// TODO: Actualizar altura 
   altura_pasada = altura_actual;
@@ -187,21 +310,6 @@ if((millis()-timer_barometro) > periodo_barometro){
 
   velocidad_vertical_actual = ((altura_actual - altura_pasada) / (millis()-timer_barometro)) * 1000 // Velocidad vertical en metros por segudo
   timer_barometro = millis();
-}
-
-// timer de brujula
-if(fase_actual == 4){ // No es necesario leer la brujula hasta la etapa 4
-  if((millis()-timer_brujula) > periodo_brujula){
-    heading_actual = compass.heading();
-    timer_brujula = millis();
-  }
-}
-// Timer para transmitir datos LORA
-/// TODO:
-if((millis()-timer_lora) > periodo_lora){
-  gps_latitud_actual = gps.location.lat();
-  gps_longitud_actual = gps.location.lng();
-  timer_gps = millis();
 }
 
 // Timer para grabar en SD
